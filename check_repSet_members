@@ -1,0 +1,89 @@
+#!/bin/bash
+user=admin                                      #database user with admin privilege (Enter your user) 
+password=pass123                                #user password (Enter your password)
+db=admin                                        #admin database name (Enter your admin database)
+host1=10.10.25.246                              #host or IP address of first server
+host2=10.10.25.245                              #host or IP address of second server
+host3=10.10.25.243                              #host or IP address of third server
+port1=33101                                     #replication port 1 (host1 server port)
+port2=33102                                     #replication port 2 (host2 server port)
+port3=33100                                     #replication port 3 (host3 server port)
+repsetname=dev1                                 #mongodb replication name        
+email=dba@geocell.ge                            #email address for received alert
+count=0                                         #count unavailable rep nodes
+logfile=/tmp/mongoCheck.log                     #log location
+logsend=/tmp/sendmail.txt                       #file for send
+mylog=mongoCheck.log                            #save rep check log
+declare -a monarr                               #array for rep health status (number)
+declare -a cmonarr                              #sum element of array
+DATE=`date "+%H:%M:%S %d/%m/%Y"`                #current date
+hostname=`hostname -f`                          #hostname
+OS=`lsb_release -a |sed -n 3p | awk -F ':' '{print $2}'`   #OS
+Platform=`uname -i`                             #OS architecture
+
+#connect to mongodb replica and move rs.status() output temp file
+/mondb_home/bin/mongo "mongodb://$host1:$port1,$host2:$port2,$host3:$port3/test?replicaSet=$repsetname" --authenticationDatabase $db --username $user --password $password --eval 'rs.status()'  > $logfile 2>/dev/null
+#check how many node is/are down
+monarr=($(echo $(sed 's/,//g' $logfile |gawk '{ if ($1 ~ /health/) {print $NF } }')))
+cmonarr=${#monarr[@]}
+replicaSet=$(awk  -F "=" '/replicaSet/ {print $NF}' $logfile) #take the replicaSet Name of database 
+
+#check log file and count, how many node(s) are down
+if grep -Eq "All nodes for set $replicaSet are down" $logfile 
+then
+ result=1 #all nodes is down Critical 
+elif grep -Eq "could not find host matching read preference" $logfile
+ then
+    result=2 #one node is available, but not PRIMARY
+   else
+     for ((i=0; i<$cmonarr;i++))
+      do
+       if [ ${monarr[$i]} -ne 1 ]
+        then
+        ((count++))
+        fi
+      done
+    if [ $count -gt 0 ]
+     then
+       result=3 #one or more nodes is down, but not all
+     else
+        result=0
+  fi
+fi
+ex -s -c '1i|Hostname = '"$hostname"' 
+Operating System = '"$OS"' 
+Platform = '"$Platform"' ' -c x $logsend
+case $result in
+        0)
+                echo -e "\nCheck Time: " $DATE  >>$logsend                    #move check data to log file
+                echo -e "MongoDB is Available, mail don't send" >> $mylog     #move notification to log file
+                ;;
+        1)
+                sed -i '1iAll nodes for set '"$replicaSet"' are down.' $logsend   #move notification to send file
+                echo "Error:" >> $logsend
+                awk -F "]" '/This has happened for 1 checks in a row./ {for (i=0;i<3;i++) {getline;print $NF}}' $logfile >> $logsend
+                echo -e "\nCheck Time: " $DATE  >>$logsend
+                mail -s  "Mongo Alert: Critical: All nodes for set $replicaSet are down" $email < $logsend    #send log file to mail
+                ;;
+        2)
+                sed -i '1iMultiple nodes for set '"$replicaSet"' are down.' $logsend
+                echo "Error:" >> $logsend
+                #awk -F "]" '/Starting new replica set monitor for/ {for (i=0;i<3;i++) {getline;getline;print $2}}' $logfile >> $logsend
+                awk -F "]" '/Starting new replica set monitor for/ {getline;getline;getline;print $2}' $logfile >> $logsend
+                echo -e "\nCheck Time: " $DATE  >>$logsend
+                mail -s  "Mongo Alert: Critical: Multiple nodes for set $replicaSet are down" $email < $logsend
+                ;;
+        3)
+                repname=$(awk '/"set"/ {printf "Rep Name = " $NF }' $logfile | sed 's/""*//g' | cut -f1 -d "," )  >> $logsend
+                gawk -F ":" '{ if ( $1 ~ /name/ ) { print "Address=" $2 ":" $3 } else if ($1 ~ /health/) {print "Health="$NF} else if ($1 ~ /stateStr/) {print "Type=" $NF}}' $logfile | sed 's/\"//g' >> $logsend
+                echo -e "\nCheck Time: " $DATE  >>$logsend
+                mail -s  "Mongo Alert: Critical: One or More Nodes is down " $email < $logsend
+                ;;
+
+        *) echo -e "Unknown Error" >>$logsend
+           echo -e "\nCheck Time: " $DATE  >>$logsend
+           mail -s  "Mongo Alert: Critical: Unknown Error " $email < $logsend
+esac
+cat $logsend >> $mylog
+echo -e "\n--------------------------------------------------\n" >> $mylog
+rm $logsend
